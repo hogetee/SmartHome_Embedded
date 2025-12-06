@@ -1,0 +1,36 @@
+# Build directories
+**/Debug/
+**/Release/
+**/build/
+
+# CubeIDE settings
+.settings/
+.metadata/
+.project
+.cproject
+
+# Auto-generated browsing/index
+.ipch/
+.autosave/
+
+# Object / binary / debug files
+*.o
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.su
+*.gcno
+*.gcda
+*.gcov
+
+# Backups
+*.bak
+*~
+*.swp
+
+# VSCode local configs
+.vscode/
+*.code-workspace
