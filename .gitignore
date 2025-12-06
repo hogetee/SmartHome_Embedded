@@ -34,3 +34,5 @@
 # VSCode local configs
 .vscode/
 *.code-workspace
+
+.DS_Store
