@@ -22,19 +22,11 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
-#include <string.h>
 #include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
-/* ---------- Mode ของระบบ ---------- */
-typedef enum {
-    MODE_AUTO = 0,
-    MODE_AWAY,
-    MODE_MANUAL
-} SystemMode_t;
 
 /* ---------- Noise Level ---------- */
 typedef enum {
@@ -69,20 +61,9 @@ typedef enum {
 
 /* ---------- ค่าปรับ (Tuning Parameters) ---------- */
 #define LDR_TH_DARK            400   // ADC > ค่านี้ (~0.3V) = มืด
-#define LDR_TH_BRIGHT          200   // ADC < ค่านี้ (~0.16V) = สว่าง
 
 #define PERSON_DISTANCE_CM    150.0f   // ระยะถือว่ามีคน (เช่น < 1.5 m)
 
-#define BASE_TIMEOUT_MS       (60 * 1000)    // ปิดไฟอัตโนมัติเมื่อไม่มีคน 60 วินาที
-#define EXT_TIMEOUT_MS        (180 * 1000)   // ถ้ามีเสียงบ่อย → ขยาย timeout
-
-#define SOUND_ACTIVE_WINDOW_MS  30000        // มีเสียงภายใน 30 วินาที → ถือว่ายัง active
-
-#define CLAP_GAP_MAX_MS       300            // ระยะห่าง clap 2 ครั้งมากสุด
-#define CLAP_RESET_MS         800            // ถ้าห่างนานกว่านี้ถือว่าเริ่มนับใหม่
-
-#define NOISE_WINDOW_MS       800      // ดูทุก 0.8 วินาที
-#define NOISE_COUNT_HIGH      2        // แค่ 2 ครั้งก็ HIGH แล้ว
 #define NOISE_HIGH_HOLD_MS   150     // ภายใน 150 ms หลังเจอเสียง = HIGH (ลดการกระพริบ)
 #define NOISE_MED_HOLD_MS    900     // ภายใน 0.9 วิ หลังเจอเสียง = MED
 #define NOISE_COUNT_WINDOW_MS (60 * 1000)  // หน้าต่างนับจำนวนเหตุการณ์เสียง 60 วิ
@@ -90,8 +71,6 @@ typedef enum {
 #define NOISE_MAX_MED_PER_WINDOW  8       // อนุญาต MED ได้ไม่เกิน 8 ครั้งใน 60 วิ
 
 #define STATUS_TX_INTERVAL_MS 500            // ส่งสถานะออก UART ทุก 500ms
-
-#define INTRUSION_HOLD_MS     5000           // โหมด Intrusion alarm (logic ไว้ก่อน เผื่อใช้ทีหลัง)
 
 /* ---------- Debug Mic RMS / dB ---------- */
 // เลือกช่อง ADC ของไมค์อนาล็อก (ต่อสายให้ตรงกับ CubeMX ด้วย)
@@ -129,24 +108,17 @@ UART_HandleTypeDef huart6;
 /* USER CODE BEGIN PV */
 
 /* ---------- ตัวแปรสถานะระบบ ---------- */
-static SystemMode_t g_mode = MODE_AUTO;
-
 static uint8_t  g_lightOn = 0;
-static uint8_t  g_intrusion = 0;  // เผื่อใช้ในโหมด AWAY ภายหลัง
 
 static uint16_t g_ldrValue = 0;
 static float    g_ldrVoltage = 0.0f;
 static uint8_t  g_isDark = 0;
-static uint8_t  g_isBright = 0;
 
 static float    g_distanceCm = 999.0f;
-static uint8_t  g_hasPerson = 0;
 
 static uint8_t  g_micDigital = 0;
 static NoiseLevel_t g_noiseLevel = NOISE_LOW;
 
-static uint32_t g_lastPersonTime = 0;
-static uint32_t g_lastSoundTime = 0;
 static uint32_t g_lastStatusTxTime = 0;
 static uint32_t g_lastNoiseWindowStart = 0;
 static uint16_t g_noiseHighCountWindow = 0;
@@ -338,7 +310,6 @@ static void Sensors_Update(uint32_t now)
   g_ldrValue = LDR_ReadRaw();
   g_ldrVoltage = (3.3f * (float)g_ldrValue) / 4095.0f;
   g_isDark   = (g_ldrValue > LDR_TH_DARK);   // กลับด้าน: ค่าสูง = มืด
-  g_isBright = (g_ldrValue < LDR_TH_BRIGHT); // ค่าต่ำ = สว่าง
 
   /* ---------- Mic Digital (อ่านเสียง + clap) ---------- */
   static uint8_t micConsec = 0; // ใช้หน่วงเพื่อลดสไปก์จาก ADC
@@ -358,7 +329,6 @@ static void Sensors_Update(uint32_t now)
 
   if (micConsec >= MIC_ADC_CONSEC_HIT) {
       raw = 1;
-      g_lastSoundTime = now; // อัปเดตเวลาเสียงล่าสุด
   } else {
       raw = 0; // ค่าต่ำหรือไม่ต่อเนื่องพอถือว่าเงียบ
   }
@@ -396,8 +366,6 @@ static void Sensors_Update(uint32_t now)
   g_distanceCm = Ultrasonic_ReadDistanceCm();
   if (g_distanceCm > 0 && g_distanceCm < PERSON_DISTANCE_CM)
   {
-    g_hasPerson = 1;
-    g_lastPersonTime = now;
   }
 }
 
@@ -453,20 +421,6 @@ static void Logic_Update(uint32_t now)
         g_lightOn = 0;
     }
 
-    /* ---------- ส่วนโหมดอื่น ๆ (ถ้ายังอยากใช้) ---------- */
-    switch (g_mode)
-    {
-        case MODE_AWAY:
-            // ถ้าไม่ใช้ intrusion แล้ว สามารถลบทิ้งได้
-            // หรือจะย้าย intrusion logic มา blend กับกฎด้านบนก็ได้
-            break;
-
-        case MODE_MANUAL:
-        case MODE_AUTO:
-        default:
-            // ตอนนี้กฎเปิด/ปิดไฟหลักถูกคุมด้วยเงื่อนไขด้านบนแล้ว
-            break;
-    }
 }
 
 /* พิมพ์ค่าไมค์เป็น RMS/dB สำหรับ debug */
@@ -505,27 +459,11 @@ static void Light_UpdateGPIO(void)
 static void Mode_LED_Update(void)
 {
   uint32_t now = HAL_GetTick();
-  static uint8_t ledOn = 0;
-
-  switch (g_mode)
-  {
-    case MODE_AUTO:
-      if ((now / 500) % 2 == 0) ledOn = 0;
-      else ledOn = 1;
-      break;
-    case MODE_AWAY:
-      ledOn = 1;
-      break;
-    case MODE_MANUAL:
-    default:
-      ledOn = 0;
-      break;
-  }
+  uint8_t ledOn = ((now / 500) % 2) ? 1 : 0;
 
   HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, ledOn ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
-/* ส่งสถานะปัจจุบันออก UART6 (ไป ESP32) และ UART2 (debug) */
 /* ส่งสถานะปัจจุบันออก UART6 (ไป ESP32) และ UART2 (debug) */
 static void UART_SendStatus(uint32_t now)
 {
@@ -533,10 +471,6 @@ static void UART_SendStatus(uint32_t now)
   g_lastStatusTxTime = now;
 
   if (g_micVrms < 1e-6f) g_micVrms = 1e-6f; // กัน log(0)
-
-  const char *modeStr = (g_mode == MODE_AUTO)   ? "AUTO" :
-                        (g_mode == MODE_AWAY)   ? "AWAY" :
-                                                 "MANUAL";
 
   const char *noiseStr = (g_noiseLevel == NOISE_LOW) ? "LOW" :
                          (g_noiseLevel == NOISE_MED) ? "MED" : "HIGH";
@@ -548,15 +482,13 @@ static void UART_SendStatus(uint32_t now)
   char buf6[128];
 
   // รูปแบบต้องตรงกับ sscanf ฝั่ง ESP32 (DIST เป็น int ไม่มีทศนิยม)
-  // STATUS;MODE=%s;LIGHT=%d;LDR=%u;DIST=%d;NOISE=%s;INTR=%d
+  // STATUS;LIGHT=%d;LDR=%u;DIST=%d;NOISE=%s
   int len6 = snprintf(buf6, sizeof(buf6),
-           "STATUS;MODE=%s;LIGHT=%d;LDR=%u;DIST=%d;NOISE=%s;INTR=%d\n",
-           modeStr,
+           "STATUS;LIGHT=%d;LDR=%u;DIST=%d;NOISE=%s\n",
            g_lightOn,
            g_ldrValue,
            distInt,
-           noiseStr,
-           g_intrusion);
+           noiseStr);
 
   if (len6 > 0) {
     HAL_UART_Transmit(&huart6, (uint8_t *)buf6, len6, 50);
@@ -565,16 +497,14 @@ static void UART_SendStatus(uint32_t now)
   /* ---------- 2) ส่งชุดเต็ม (พร้อม float) ไปดูใน PuTTY ผ่าน USART2 ---------- */
   char buf2[240];
   int len2 = snprintf(buf2, sizeof(buf2),
-           "STATUS;MODE=%s;LIGHT=%d;LDR=%u;LDRV=%.3f;DIST=%.1f;NOISE=%s;"
-           "MIC=%d;INTR=%d;MICADC=%u;MICVR=%.3f;MICDB=%.1f;MICSPL=%.1f\r\n",
-           modeStr,
+           "STATUS;LIGHT=%d;LDR=%u;LDRV=%.3f;DIST=%.1f;NOISE=%s;"
+           "MIC=%d;MICADC=%u;MICVR=%.3f;MICDB=%.1f;MICSPL=%.1f\r\n",
            g_lightOn,
            g_ldrValue,
            g_ldrVoltage,
            g_distanceCm,
            noiseStr,
            g_micDigital,
-           g_intrusion,
            g_micAdcRms,
            g_micVrms,
            g_micDb,
