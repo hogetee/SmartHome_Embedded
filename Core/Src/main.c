@@ -68,8 +68,8 @@ typedef enum {
 #define LED_Pin               LD2_Pin        // PA5
 
 /* ---------- ค่าปรับ (Tuning Parameters) ---------- */
-#define LDR_TH_DARK           1800   // ADC < ค่านี้ = มืด (ต้องเทสต์จริง)
-#define LDR_TH_BRIGHT         2300   // ADC > ค่านี้ = สว่าง (ยังไม่ใช้เยอะ)
+#define LDR_TH_DARK            400   // ADC > ค่านี้ (~0.3V) = มืด
+#define LDR_TH_BRIGHT          200   // ADC < ค่านี้ (~0.16V) = สว่าง
 
 #define PERSON_DISTANCE_CM    150.0f   // ระยะถือว่ามีคน (เช่น < 1.5 m)
 
@@ -134,6 +134,7 @@ static uint8_t  g_lightOn = 0;
 static uint8_t  g_intrusion = 0;  // เผื่อใช้ในโหมด AWAY ภายหลัง
 
 static uint16_t g_ldrValue = 0;
+static float    g_ldrVoltage = 0.0f;
 static uint8_t  g_isDark = 0;
 static uint8_t  g_isBright = 0;
 
@@ -155,6 +156,7 @@ static float    g_micVrms   = 0.0f;
 static float    g_micDb     = 0.0f;
 static float    g_micDbSpl  = 0.0f; // dB SPL (อ้างอิงค่าคาลิเบรต)
 
+static uint32_t g_cycPerUs  = 0;    // สำหรับจับเวลาระดับไมโครวินาทีด้วย DWT
 
 /* USER CODE END PV */
 
@@ -163,6 +165,8 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
+static void DWT_Init(void);
+static uint32_t micros(void);
 /* USER CODE BEGIN PFP */
 
 /* ---------- ฟังก์ชันของระบบ ---------- */
@@ -216,49 +220,65 @@ static uint16_t LDR_ReadRaw(void)
 
 static float Ultrasonic_ReadDistanceCm(void)
 {
-  /* 1) ส่ง Trigger ประมาณ 10us */
+  /* 0) ถ้า DWT ยังไม่พร้อม ให้ fallback แบบหยาบ */
+  if (g_cycPerUs == 0) {
+    DWT_Init();
+  }
+
+  /* 1) จำกัด rate ยิง ultrasonic อย่างน้อย 70ms ต่อครั้ง */
+  static uint32_t lastTrigUs = 0;
+  static float lastDistance = 999.0f;
+  static float filtered = -1.0f;
+  uint32_t nowUs = micros();
+  if (nowUs - lastTrigUs < 70000U) { // ยังไม่ครบ 70 ms ใช้ค่าล่าสุด
+    return (filtered < 0.0f) ? lastDistance : filtered;
+  }
+
+  /* 2) ส่ง Trigger สูง 10us แบบกำหนดเวลาชัดเจน */
   HAL_GPIO_WritePin(US_TRIG_GPIO_Port, US_TRIG_Pin, GPIO_PIN_RESET);
-  HAL_Delay(1); // 1 ms เคลียร์ก่อน
+  uint32_t tTrig = micros();
+  while (micros() - tTrig < 5);    // hold low ~5us
   HAL_GPIO_WritePin(US_TRIG_GPIO_Port, US_TRIG_Pin, GPIO_PIN_SET);
-  for (volatile int i = 0; i < 300; i++);   // delay ~10us (หยาบๆ)
+  tTrig = micros();
+  while (micros() - tTrig < 10);   // high 10us ตามสเปก
   HAL_GPIO_WritePin(US_TRIG_GPIO_Port, US_TRIG_Pin, GPIO_PIN_RESET);
+  lastTrigUs = micros();
 
   /* 2) รอ Echo ขึ้น HIGH พร้อม timeout กันค้าง */
-  uint32_t tickStart = HAL_GetTick();
+  uint32_t tWaitStart = micros();
   while (HAL_GPIO_ReadPin(US_ECHO_GPIO_Port, US_ECHO_Pin) == GPIO_PIN_RESET)
   {
-    if ((HAL_GetTick() - tickStart) > 50) {
-      return 999.0f;   // รอนานเกิน 50 ms → ถือว่าไม่มีอะไรสะท้อน
+    if ((micros() - tWaitStart) > 40000) { // 40 ms timeout
+      return (filtered < 0.0f) ? lastDistance : filtered;   // รอนานเกิน → ใช้ค่าก่อนหน้า
     }
   }
 
-  /* 3) วัดความกว้าง pulse แบบหน่วย ms (หยาบ ๆ) */
-  uint32_t tStart = HAL_GetTick();
+  /* 3) วัดความกว้าง pulse แบบไมโครวินาที */
+  uint32_t tStart = micros();
   while (HAL_GPIO_ReadPin(US_ECHO_GPIO_Port, US_ECHO_Pin) == GPIO_PIN_SET)
   {
-    if ((HAL_GetTick() - tStart) > 50) {
-      return 999.0f;   // pulse ยาวผิดปกติ → ถือว่า error
+    if ((micros() - tStart) > 40000) {
+      return (filtered < 0.0f) ? lastDistance : filtered;   // pulse ยาวผิดปกติ → ใช้ค่าก่อนหน้า
     }
   }
-  uint32_t tEnd = HAL_GetTick();
-  uint32_t dt_ms = tEnd - tStart;
+  uint32_t dt_us = micros() - tStart;
 
-  if (dt_ms == 0 || dt_ms > 50) {
-    return 999.0f;     // กันกรณีหลุด ๆ
+  if (dt_us == 0 || dt_us > 40000) {
+    return (filtered < 0.0f) ? lastDistance : filtered;     // กันกรณีหลุด ๆ → ใช้ค่าก่อนหน้า
   }
 
-  /* 4) แปลงเป็นระยะ (ประมาณ 17 cm ต่อ 1 ms) */
-  float distance = dt_ms * 17.0f;   // หน่วย cm (คร่าว ๆ)
+  /* 4) แปลงเป็นระยะ: sound speed ~0.0343 cm/us, หาร 2 เพราะไป-กลับ */
+  float distance = ((float)dt_us) * 0.0343f * 0.5f;
 
   /* 6) low-pass filter ให้ค่าเนียนเหมือนเดิม */
-  static float filtered = -1.0f;
   if (filtered < 0.0f) {
     filtered = distance;
   } else {
     filtered = 0.7f * filtered + 0.3f * distance;
   }
 
-  return filtered;
+  lastDistance = filtered;
+  return lastDistance;
 }
 
 /* อ่านไมค์อนาล็อกเป็น RMS + dB (ใช้สำหรับ debug) */
@@ -315,8 +335,9 @@ static void Sensors_Update(uint32_t now)
 {
   /* ---------- LDR ---------- */
   g_ldrValue = LDR_ReadRaw();
-  g_isDark   = (g_ldrValue < LDR_TH_DARK);
-  g_isBright = (g_ldrValue > LDR_TH_BRIGHT);
+  g_ldrVoltage = (3.3f * (float)g_ldrValue) / 4095.0f;
+  g_isDark   = (g_ldrValue > LDR_TH_DARK);   // กลับด้าน: ค่าสูง = มืด
+  g_isBright = (g_ldrValue < LDR_TH_BRIGHT); // ค่าต่ำ = สว่าง
 
   /* ---------- Mic Digital (อ่านเสียง + clap) ---------- */
   static uint8_t micConsec = 0; // ใช้หน่วงเพื่อลดสไปก์จาก ADC
@@ -512,7 +533,7 @@ static void UART_SendStatus(uint32_t now)
   // g_micAdcRms / g_micVrms / g_micDb ถูกอัปเดตแล้วใน Sensors_Update (รวม fallback ADC)
   if (g_micVrms < 1e-6f) g_micVrms = 1e-6f; // กัน log(0)
 
-  char buf[196];
+  char buf[240];
 
   const char *modeStr = (g_mode == MODE_AUTO)   ? "AUTO" :
                         (g_mode == MODE_AWAY)   ? "AWAY" :
@@ -522,10 +543,11 @@ static void UART_SendStatus(uint32_t now)
                          (g_noiseLevel == NOISE_MED) ? "MED" : "HIGH";
 
   snprintf(buf, sizeof(buf),
-           "STATUS;MODE=%s;LIGHT=%d;LDR=%u;DIST=%.1f;NOISE=%s;MIC=%d;INTR=%d;MICADC=%u;MICVR=%.3f;MICDB=%.1f;MICSPL=%.1f\r\n",
+           "STATUS;MODE=%s;LIGHT=%d;LDR=%u;LDRV=%.3f;DIST=%.1f;NOISE=%s;MIC=%d;INTR=%d;MICADC=%u;MICVR=%.3f;MICDB=%.1f;MICSPL=%.1f\r\n",
            modeStr,
            g_lightOn,
            g_ldrValue,
+           g_ldrVoltage,
            g_distanceCm,
            noiseStr,
            g_micDigital,
@@ -580,6 +602,8 @@ int main(void)
 
   printf("\r\n[SYS] Smart Light Controller start\r\n");
   g_lastNoiseWindowStart = HAL_GetTick();
+
+  DWT_Init(); // เตรียม DWT สำหรับจับเวลา us (ใช้กับ Ultrasonic)
 
   /* USER CODE END 2 */
 
@@ -793,6 +817,26 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/* เตรียม DWT counter สำหรับจับเวลาระดับไมโครวินาที */
+static void DWT_Init(void)
+{
+  if (!(CoreDebug->DEMCR & CoreDebug_DEMCR_TRCENA_Msk)) {
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  }
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  g_cycPerUs = HAL_RCC_GetHCLKFreq() / 1000000U;
+  if (g_cycPerUs == 0) g_cycPerUs = 1;
+}
+
+/* คืนค่าไมโครวินาทีจาก DWT counter */
+static uint32_t micros(void)
+{
+  if (g_cycPerUs == 0) {
+    return HAL_GetTick() * 1000U; // fallback หยาบ
+  }
+  return DWT->CYCCNT / g_cycPerUs;
+}
 
 /* USER CODE END 4 */
 
