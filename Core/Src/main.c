@@ -124,6 +124,7 @@ typedef enum {
 ADC_HandleTypeDef hadc1;
 
 UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart6;
 
 /* USER CODE BEGIN PV */
 
@@ -165,8 +166,9 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
-static void DWT_Init(void);
-static uint32_t micros(void);
+static void MX_USART6_UART_Init(void);
+void DWT_Init(void);
+uint32_t micros(void);
 /* USER CODE BEGIN PFP */
 
 /* ---------- ฟังก์ชันของระบบ ---------- */
@@ -193,7 +195,6 @@ int __io_putchar(int ch)
   HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
   return ch;
 }
-
 /* อ่าน ADC ของ LDR */
 static uint16_t LDR_ReadRaw(void)
 {
@@ -524,16 +525,14 @@ static void Mode_LED_Update(void)
   HAL_GPIO_WritePin(LED_GPIO_Port, LED_Pin, ledOn ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
-/* ส่งสถานะปัจจุบันออก UART2 */
+/* ส่งสถานะปัจจุบันออก UART6 (ไป ESP32) และ UART2 (debug) */
+/* ส่งสถานะปัจจุบันออก UART6 (ไป ESP32) และ UART2 (debug) */
 static void UART_SendStatus(uint32_t now)
 {
   if (now - g_lastStatusTxTime < STATUS_TX_INTERVAL_MS) return;
   g_lastStatusTxTime = now;
 
-  // g_micAdcRms / g_micVrms / g_micDb ถูกอัปเดตแล้วใน Sensors_Update (รวม fallback ADC)
   if (g_micVrms < 1e-6f) g_micVrms = 1e-6f; // กัน log(0)
-
-  char buf[240];
 
   const char *modeStr = (g_mode == MODE_AUTO)   ? "AUTO" :
                         (g_mode == MODE_AWAY)   ? "AWAY" :
@@ -542,8 +541,32 @@ static void UART_SendStatus(uint32_t now)
   const char *noiseStr = (g_noiseLevel == NOISE_LOW) ? "LOW" :
                          (g_noiseLevel == NOISE_MED) ? "MED" : "HIGH";
 
-  snprintf(buf, sizeof(buf),
-           "STATUS;MODE=%s;LIGHT=%d;LDR=%u;LDRV=%.3f;DIST=%.1f;NOISE=%s;MIC=%d;INTR=%d;MICADC=%u;MICVR=%.3f;MICDB=%.1f;MICSPL=%.1f\r\n",
+  // แปลงระยะจาก float → int (cm) สำหรับส่งไป ESP32
+  uint16_t distInt = (g_distanceCm < 0.0f) ? 0 : (uint16_t)(g_distanceCm + 0.5f);
+
+  /* ---------- 1) ส่งชุดสั้นไป ESP32 ผ่าน USART6 ---------- */
+  char buf6[128];
+
+  // รูปแบบต้องตรงกับ sscanf ฝั่ง ESP32 (DIST เป็น int ไม่มีทศนิยม)
+  // STATUS;MODE=%s;LIGHT=%d;LDR=%u;DIST=%d;NOISE=%s;INTR=%d
+  int len6 = snprintf(buf6, sizeof(buf6),
+           "STATUS;MODE=%s;LIGHT=%d;LDR=%u;DIST=%d;NOISE=%s;INTR=%d\n",
+           modeStr,
+           g_lightOn,
+           g_ldrValue,
+           distInt,
+           noiseStr,
+           g_intrusion);
+
+  if (len6 > 0) {
+    HAL_UART_Transmit(&huart6, (uint8_t *)buf6, len6, 50);
+  }
+
+  /* ---------- 2) ส่งชุดเต็ม (พร้อม float) ไปดูใน PuTTY ผ่าน USART2 ---------- */
+  char buf2[240];
+  int len2 = snprintf(buf2, sizeof(buf2),
+           "STATUS;MODE=%s;LIGHT=%d;LDR=%u;LDRV=%.3f;DIST=%.1f;NOISE=%s;"
+           "MIC=%d;INTR=%d;MICADC=%u;MICVR=%.3f;MICDB=%.1f;MICSPL=%.1f\r\n",
            modeStr,
            g_lightOn,
            g_ldrValue,
@@ -557,7 +580,9 @@ static void UART_SendStatus(uint32_t now)
            g_micDb,
            g_micDbSpl);
 
-  HAL_UART_Transmit(&huart2, (uint8_t *)buf, strlen(buf), 50);
+  if (len2 > 0) {
+    HAL_UART_Transmit(&huart2, (uint8_t *)buf2, len2, 50);
+  }
 }
 
 /* โครงรับคำสั่งจาก UART (ยังว่างไว้ให้ต่อยอด) */
@@ -598,6 +623,7 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_ADC1_Init();
+  MX_USART6_UART_Init();
   /* USER CODE BEGIN 2 */
 
   printf("\r\n[SYS] Smart Light Controller start\r\n");
@@ -700,13 +726,13 @@ static void MX_ADC1_Init(void)
   hadc1.Instance = ADC1;
   hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
-  hadc1.Init.ScanConvMode = DISABLE;           // ใช้ single conversion สลับช่องเอง
+  hadc1.Init.ScanConvMode = ENABLE;
   hadc1.Init.ContinuousConvMode = DISABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.NbrOfConversion = 2;
   hadc1.Init.DMAContinuousRequests = DISABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
@@ -714,10 +740,21 @@ static void MX_ADC1_Init(void)
     Error_Handler();
   }
 
-  /** Configure default channel (LDR) */
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
   sConfig.Channel = ADC_CHANNEL_0;
   sConfig.Rank = 1;
   sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
+  */
+  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Rank = 2;
+  sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -758,6 +795,39 @@ static void MX_USART2_UART_Init(void)
   /* USER CODE BEGIN USART2_Init 2 */
 
   /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * @brief USART6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART6_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART6_Init 0 */
+
+  /* USER CODE END USART6_Init 0 */
+
+  /* USER CODE BEGIN USART6_Init 1 */
+
+  /* USER CODE END USART6_Init 1 */
+  huart6.Instance = USART6;
+  huart6.Init.BaudRate = 115200;
+  huart6.Init.WordLength = UART_WORDLENGTH_8B;
+  huart6.Init.StopBits = UART_STOPBITS_1;
+  huart6.Init.Parity = UART_PARITY_NONE;
+  huart6.Init.Mode = UART_MODE_TX_RX;
+  huart6.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart6.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART6_Init 2 */
+
+  /* USER CODE END USART6_Init 2 */
 
 }
 
@@ -818,7 +888,7 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 /* เตรียม DWT counter สำหรับจับเวลาระดับไมโครวินาที */
-static void DWT_Init(void)
+void DWT_Init(void)
 {
   if (!(CoreDebug->DEMCR & CoreDebug_DEMCR_TRCENA_Msk)) {
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -830,7 +900,7 @@ static void DWT_Init(void)
 }
 
 /* คืนค่าไมโครวินาทีจาก DWT counter */
-static uint32_t micros(void)
+uint32_t micros(void)
 {
   if (g_cycPerUs == 0) {
     return HAL_GetTick() * 1000U; // fallback หยาบ
