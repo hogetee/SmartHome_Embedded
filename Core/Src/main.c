@@ -102,12 +102,12 @@ typedef enum {
 #define MIC_DEBUG_ENABLE      0              // 1 = เปิดพิมพ์ debug dB, 0 = ปิด
 
 // ใช้คาลิเบรต dB SPL: วัด vrms_ref ตอนเปิดเสียงที่ spl_ref_dB (เช่น 94 dB @1kHz)
-#define MIC_SPL_REF_DB        55.0f          // ใช้ 55 dB เป็นระดับเสียงปกติ (ambient)
-#define MIC_VRMS_REF          0.0020f        // Vrms ที่ได้เมื่อเสียง ~55 dB (ปรับตามที่วัดจริง)
+#define MIC_SPL_REF_DB        40.0f          // ใช้ 55 dB เป็นระดับเสียงปกติ (ambient)
+#define MIC_VRMS_REF          0.0015f        // Vrms ที่ได้เมื่อเสียง ~55 dB (ปรับตามที่วัดจริง)
 
 // ถ้าขา D0 ไม่เปลี่ยน ให้ใช้ค่าจาก ADC เป็นตัวตัดสินแทน: 1 เมื่อ RMS สูงกว่า threshold นี้ (หน่วย ADC count)
-#define MIC_ADC_THRESHOLD     100            // ปรับตามสภาพจริง (ดูจาก MICADC ใน STATUS)
-#define MIC_ADC_CONSEC_HIT    3              // ต้องสูงต่อเนื่องกี่ครั้งถึงจะถือว่ามีเสียง (กันสไปก์)
+#define MIC_ADC_THRESHOLD     3            // ปรับตามสภาพจริง (ดูจาก MICADC ใน STATUS)
+#define MIC_ADC_CONSEC_HIT    1              // ต้องสูงต่อเนื่องกี่ครั้งถึงจะถือว่ามีเสียง (กันสไปก์)
 
 /* USER CODE END PD */
 
@@ -351,6 +351,7 @@ static void Sensors_Update(uint32_t now)
 
   g_micDigital = raw; // ใช้ ADC เป็นตัวตัดสินหลัก (D0 เป็นแค่ตัวเสริม)
   g_micAdcRms = adcRmsTmp;
+  vrmsTmp = vrmsTmp * 5.0f; // ขยาย gain (ขึ้นกับวงจรไมค์)
   g_micVrms   = vrmsTmp;
   g_micDb     = dbTmp;
   g_micDbSpl  = MIC_SPL_REF_DB + 20.0f * log10f((vrmsTmp < 1e-6f ? 1e-6f : vrmsTmp) / MIC_VRMS_REF);
