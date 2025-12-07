@@ -83,8 +83,8 @@ typedef enum {
 
 #define NOISE_WINDOW_MS       800      // ดูทุก 0.8 วินาที
 #define NOISE_COUNT_HIGH      2        // แค่ 2 ครั้งก็ HIGH แล้ว
-#define NOISE_HIGH_HOLD_MS   100     // ภายใน 100 ms หลังเจอเสียง = HIGH (ลด hold ไม่ให้ค้าง)
-#define NOISE_MED_HOLD_MS    800     // ภายใน 0.8 วิ หลังเจอเสียง = MED
+#define NOISE_HIGH_HOLD_MS   150     // ภายใน 150 ms หลังเจอเสียง = HIGH (ลดการกระพริบ)
+#define NOISE_MED_HOLD_MS    900     // ภายใน 0.9 วิ หลังเจอเสียง = MED
 #define NOISE_COUNT_WINDOW_MS (60 * 1000)  // หน้าต่างนับจำนวนเหตุการณ์เสียง 60 วิ
 #define NOISE_MAX_HIGH_PER_WINDOW 3       // อนุญาต HIGH ได้ไม่เกิน 3 ครั้งใน 60 วิ
 #define NOISE_MAX_MED_PER_WINDOW  8       // อนุญาต MED ได้ไม่เกิน 8 ครั้งใน 60 วิ
@@ -97,17 +97,21 @@ typedef enum {
 // เลือกช่อง ADC ของไมค์อนาล็อก (ต่อสายให้ตรงกับ CubeMX ด้วย)
 #define MIC_ADC_CHANNEL       ADC_CHANNEL_1   // ปรับตามขาที่ใช้ต่อไมค์ AOUT
 #define MIC_ADC_SAMPLE_TIME   ADC_SAMPLETIME_480CYCLES  // เพิ่มเวลา sample ให้สัญญาณนิ่ง
-#define MIC_RMS_SAMPLES       64             // จำนวนตัวอย่างต่อเฟรม RMS
+#define MIC_RMS_SAMPLES       16             // จำนวนตัวอย่างต่อเฟรม RMS
 #define MIC_DEBUG_INTERVAL_MS 250            // เวลาพิมพ์ debug ต่อครั้ง
 #define MIC_DEBUG_ENABLE      0              // 1 = เปิดพิมพ์ debug dB, 0 = ปิด
 
 // ใช้คาลิเบรต dB SPL: วัด vrms_ref ตอนเปิดเสียงที่ spl_ref_dB (เช่น 94 dB @1kHz)
-#define MIC_SPL_REF_DB        40.0f          // ใช้ 55 dB เป็นระดับเสียงปกติ (ambient)
-#define MIC_VRMS_REF          0.0015f        // Vrms ที่ได้เมื่อเสียง ~55 dB (ปรับตามที่วัดจริง)
+#define MIC_SPL_REF_DB        60.0f          // ใช้ ref ~60 dB (คาลิเบรตเชิงสัมพัทธ์)
+#define MIC_VRMS_REF          0.0030f        // Vrms ที่ได้เมื่อเสียง ~55 dB (ปรับตามที่วัดจริง)
 
 // ถ้าขา D0 ไม่เปลี่ยน ให้ใช้ค่าจาก ADC เป็นตัวตัดสินแทน: 1 เมื่อ RMS สูงกว่า threshold นี้ (หน่วย ADC count)
-#define MIC_ADC_THRESHOLD     3            // ปรับตามสภาพจริง (ดูจาก MICADC ใน STATUS)
-#define MIC_ADC_CONSEC_HIT    1              // ต้องสูงต่อเนื่องกี่ครั้งถึงจะถือว่ามีเสียง (กันสไปก์)
+#define MIC_ADC_THRESHOLD     4            // ลด threshold ให้ตอบสนองสัญญาณ ADC ที่อ่อน (ดู MICADC ใน STATUS)
+#define MIC_ADC_CONSEC_HIT    2              // ต้องสูงต่อเนื่องกี่ครั้งถึงจะถือว่ามีเสียง (กันสไปก์)
+
+// Threshold dB SPL สำหรับจัดระดับเสียง (เชิงสัมพัทธ์)
+#define NOISE_DB_MED          63.0f   // >63–70 = MED
+#define NOISE_DB_HIGH         70.0f   // >70 = HIGH
 
 /* USER CODE END PD */
 
@@ -264,57 +268,45 @@ static float Mic_ReadRmsDb(uint16_t *adcRmsOut, float *vrmsOut)
   ADC_ChannelConfTypeDef sConfig = {0};
   sConfig.Rank = 1;
   sConfig.SamplingTime = MIC_ADC_SAMPLE_TIME;
+  sConfig.Channel = MIC_ADC_CHANNEL; // ใช้ช่องไมค์โดยตรง (ไม่ fallback)
 
-  uint16_t adcRmsLocal = 0;
-  float    vrmsLocal = 0.0f;
-  float    dbLocal   = -120.0f;
+  float mean = 0.0f;
+  float m2   = 0.0f;
+  uint32_t n = 0;
 
-  // helper อ่าน RMS จาก channel ที่ระบุ
-  const uint32_t channelsToTry[2] = { MIC_ADC_CHANNEL, ADC_CHANNEL_0 }; // ลองช่องไมค์ก่อน ตามด้วย CH0 เป็น fallback
-
-  for (int chIdx = 0; chIdx < 2; chIdx++)
+  for (int i = 0; i < MIC_RMS_SAMPLES; i++)
   {
-    float mean = 0.0f;
-    float m2   = 0.0f;
-    uint32_t n = 0;
-
-    sConfig.Channel = channelsToTry[chIdx];
-    for (int i = 0; i < MIC_RMS_SAMPLES; i++)
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+    HAL_ADC_Start(&hadc1);
+    if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
     {
-      HAL_ADC_ConfigChannel(&hadc1, &sConfig);
-      HAL_ADC_Start(&hadc1);
-      if (HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK)
-      {
-        uint32_t v = HAL_ADC_GetValue(&hadc1);
-        n++;
-        float delta = (float)v - mean;
-        mean += delta / (float)n;
-        float delta2 = (float)v - mean;
-        m2 += delta * delta2;
-      }
-      HAL_ADC_Stop(&hadc1);
+      uint32_t v = HAL_ADC_GetValue(&hadc1);
+      n++;
+      float delta = (float)v - mean;
+      mean += delta / (float)n;
+      float delta2 = (float)v - mean;
+      m2 += delta * delta2;
     }
-
-    if (n > 0)
-    {
-      float variance = m2 / (float)n;
-      if (variance < 0) variance = 0;
-      float adcRmsFloat = sqrtf(variance);
-      if (adcRmsFloat < 1e-3f) adcRmsFloat = 1e-3f;
-      float vrms = adcRmsFloat * (3.3f / 4095.0f);
-      float db   = 20.0f * log10f(vrms / 1.0f);
-      adcRmsLocal = (uint16_t)(adcRmsFloat + 0.5f);
-      vrmsLocal   = vrms;
-      dbLocal     = db;
-
-      // ถ้าไม่ใช่ 0 แล้ว ไม่ต้องลองช่องถัดไป
-      if (adcRmsLocal != 0) break;
-    }
+    HAL_ADC_Stop(&hadc1);
   }
 
-  if (adcRmsOut) *adcRmsOut = adcRmsLocal;
-  if (vrmsOut) *vrmsOut = vrmsLocal;
-  return dbLocal;
+  float adcRmsFloat = 0.0f;
+  float vrms = 0.0f;
+  float db   = -120.0f;
+
+  if (n > 0)
+  {
+    float variance = m2 / (float)n;
+    if (variance < 0) variance = 0;
+    adcRmsFloat = sqrtf(variance);
+    if (adcRmsFloat < 1e-3f) adcRmsFloat = 1e-3f;
+    vrms = adcRmsFloat * (3.3f / 4095.0f);
+    db   = 20.0f * log10f(vrms / 1.0f);
+  }
+
+  if (adcRmsOut) *adcRmsOut = (uint16_t)(adcRmsFloat + 0.5f);
+  if (vrmsOut) *vrmsOut = vrms;
+  return db;
 }
 
 
@@ -351,10 +343,32 @@ static void Sensors_Update(uint32_t now)
 
   g_micDigital = raw; // ใช้ ADC เป็นตัวตัดสินหลัก (D0 เป็นแค่ตัวเสริม)
   g_micAdcRms = adcRmsTmp;
-  vrmsTmp = vrmsTmp * 5.0f; // ขยาย gain (ขึ้นกับวงจรไมค์)
+  //vrmsTmp = vrmsTmp * 5.0f; // ขยาย gain (ขึ้นกับวงจรไมค์)
   g_micVrms   = vrmsTmp;
-  g_micDb     = dbTmp;
   g_micDbSpl  = MIC_SPL_REF_DB + 20.0f * log10f((vrmsTmp < 1e-6f ? 1e-6f : vrmsTmp) / MIC_VRMS_REF);
+  g_micDb     = g_micDbSpl;
+
+  /* ---------- อัปเดตระดับ NOISE ด้วย SPL + hold time กันแกว่ง ---------- */
+  static uint32_t lastHighEventMs = 0;
+  static uint32_t lastMedEventMs  = 0;
+
+  if (g_micDbSpl >= NOISE_DB_HIGH) {
+      lastHighEventMs = now;
+      lastMedEventMs  = now;
+  } else if (g_micDbSpl >= NOISE_DB_MED) {
+      lastMedEventMs = now;
+  }
+
+  uint8_t highActive = (lastHighEventMs && ((now - lastHighEventMs) < NOISE_HIGH_HOLD_MS));
+  uint8_t medActive  = (lastMedEventMs  && ((now - lastMedEventMs)  < NOISE_MED_HOLD_MS));
+
+  if (highActive) {
+      g_noiseLevel = NOISE_HIGH;
+  } else if (medActive) {
+      g_noiseLevel = NOISE_MED;
+  } else {
+      g_noiseLevel = NOISE_LOW;
+  }
 
   /* ---------- Ultrasonic ---------- */
   g_distanceCm = Ultrasonic_ReadDistanceCm();
@@ -367,15 +381,6 @@ static void Sensors_Update(uint32_t now)
 
 static void Logic_Update(uint32_t now)
 {
-    /* ---------- อัปเดตระดับ NOISE จากค่า MICSPL โดยตรง ---------- */
-    if (g_micDbSpl < 60.0f) {
-        g_noiseLevel = NOISE_LOW;
-    } else if (g_micDbSpl < 75.0f) {  // 60–75 dB = MED
-        g_noiseLevel = NOISE_MED;
-    } else {
-        g_noiseLevel = NOISE_HIGH;    // >= 75 dB
-    }
-
     /* ---------- นับจำนวนเหตุการณ์เสียงในหน้าต่าง 60 วิ ---------- */
     static NoiseLevel_t prevNoiseLevel = NOISE_LOW;
     if (prevNoiseLevel != g_noiseLevel)
